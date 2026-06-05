@@ -1,185 +1,469 @@
-
-"""Smart Healthcare App — Backend API
-Phase 1: Prescription Summarization Endpoint"""
-
-
-
+import os
+import json
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
-import re
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from gtts import gTTS
+import uuid
+import cohere
+from fastapi.staticfiles import StaticFiles
+from fastapi import UploadFile, File
+from PIL import Image
+import pytesseract
+from datetime import datetime, timedelta
+from typing import Optional
 
-app = FastAPI(
-    title="Smart Healthcare API",
-    description="Backend for Smart Healthcare Android App — Rural Communities",
-    version="1.0.0-phase1"
-)
 
+load_dotenv()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Smart Healthcare Android Application Backend")
 
+# create audio folder automatically
+os.makedirs("audio", exist_ok=True)
+
+app.mount("/audio", StaticFiles(directory="audio"), name="audio")
+
+co = cohere.ClientV2(os.getenv("COHERE_API_KEY"))
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 class PrescriptionRequest(BaseModel):
-    prescription_text: str
-
-class Medicine(BaseModel):
-    name: str
-    dose: str
-    frequency: str
-    duration: str
-    instruction: str
-
-class PrescriptionSummary(BaseModel):
-    patient_summary: str
-    medicines: List[Medicine]
-    warnings: List[str]
-
-
-
-FREQUENCY_MAP = {
-    "OD":    "Once daily",
-    "BD":    "Twice daily",
-    "TDS":   "Three times daily",
-    "QID":   "Four times daily",
-    "SOS":   "When needed (if pain/fever)",
-    "HS":    "At bedtime",
-    "1-0-1": "Morning and night",
-    "1-1-1": "Three times a day",
-    "1-0-0": "Once daily in the morning",
-    "0-0-1": "Once daily at night",
-    "0-1-0": "Once daily at noon",
-}
-
-STANDARD_WARNINGS = [
-    "Complete the full course even if symptoms improve.",
-    "Do not take medicines on an empty stomach unless instructed.",
-    "Consult your doctor immediately if rash, swelling, or difficulty breathing occurs.",
-    "Store all medicines away from sunlight and out of reach of children.",
-]
-
-
-
-def parse_medicine_line(line: str) -> Medicine | None:
-    line = line.strip()
-    if not re.search(r'\b(Tab|Cap|Syp|Inj|Drop|Oint)\.?\b', line, re.IGNORECASE):
-        return None
-
-   
-    name_match = re.search(
-        r'(Tab|Cap|Syp|Inj|Drop|Oint)\.?\s+([\w\s\-]+?)(\d+\s*(?:mg|ml|mcg|g))?(?:\s+[\-—]|\s+\d|\s+x|\s+OD|\s+BD|\s+TDS|$)',
-        line, re.IGNORECASE
-    )
-    name = "Unknown Medicine"
-    dose = "As prescribed"
-    if name_match:
-        med_type = name_match.group(1).capitalize()
-        med_name = name_match.group(2).strip().title()
-        strength = name_match.group(3) or ""
-        name = f"{med_type}. {med_name} {strength}".strip()
-        dose = strength if strength else "1 unit"
-
- 
-    frequency = "As directed by doctor"
-    for abbr, label in FREQUENCY_MAP.items():
-        if re.search(rf'\b{re.escape(abbr)}\b', line, re.IGNORECASE):
-            frequency = label
-            break
-
-   
-    dur_match = re.search(r'x?\s*(\d+)\s*days?', line, re.IGNORECASE)
-    duration = f"{dur_match.group(1)} days" if dur_match else "As prescribed"
-
-    
-    inst_match = re.search(r'\(([^)]+)\)', line)
-    instruction = inst_match.group(1).capitalize() if inst_match else "As directed"
-
-    return Medicine(
-        name=name,
-        dose=dose,
-        frequency=frequency,
-        duration=duration,
-        instruction=instruction
-    )
-
-
-
-def build_patient_summary(medicines: List[Medicine]) -> str:
-    if not medicines:
-        return "Please follow your doctor's prescription instructions carefully."
-    parts = [
-        f"Take {m.name} {m.frequency.lower()} for {m.duration}. {m.instruction}."
-        for m in medicines
-    ]
-    return " ".join(parts)
-
+    prescription_text: str = Field(..., min_length=5)
+    language: str = Field(..., description="English, Hindi, or Odia")
 
 
 @app.get("/")
-def root():
+def home():
     return {
-        "service": "Smart Healthcare API",
-        "phase": "Phase 1 — Prescription Summarization",
-        "status": "operational"
+        "message": "Smart Healthcare Backend is running",
+        "ai_mode": "LLM-based prescription summarization"
     }
 
-@app.post("/summarize-prescription", response_model=PrescriptionSummary)
+
+@app.post("/summarize-prescription")
 def summarize_prescription(request: PrescriptionRequest):
-    """
-    Accepts raw prescription text and returns a structured, simplified summary.
+    try:
+        prompt = f"""
+You are a healthcare assistant for rural patients.
 
-    Phase 1: Rule-based NLP with pattern matching.
-    Phase 2: Will be upgraded to Claude API for contextual understanding,
-             multilingual output (Hindi/English/Odia), and OCR pipeline.
-    """
-    text = request.prescription_text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Prescription text cannot be empty.")
+Summarize the following prescription in simple {request.language}.
+Do not diagnose. Do not invent medicines.
+Return ONLY valid JSON with exactly these keys:
+- summary: string, overall summary
+- medicines: list of objects, each with keys: name, dosage, frequency, duration, instructions
+- dosage_instructions: string, general dosage guidance
+- safety_warnings: string, important warnings
+- voice_text: string, simple text to be read aloud
+- language: string
 
-    medicines = []
-    for line in text.splitlines():
-        med = parse_medicine_line(line)
-        if med:
-            medicines.append(med)
+Prescription:
+{request.prescription_text}
+"""
 
-    patient_summary = build_patient_summary(medicines)
+        response = co.chat(
+            model="command-r-plus-08-2024",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        result_text = response.message.content[0].text
+        result_json = json.loads(result_text)
+
+        voice_text = result_json["voice_text"]
+
+        language_map = {
+          "English": "en",
+          "Hindi": "hi",
+          "Odia": "hi"
+        }
+
+        tts_lang = language_map.get(request.language, "en")
+
+        audio_filename = f"{uuid.uuid4()}.mp3"
+        audio_path = f"audio/{audio_filename}"
+
+        tts = gTTS(text=voice_text, lang=tts_lang)
+        tts.save(audio_path)
+
+        result_json["audio_file"] = audio_filename
+
+        return {
+            "status": "success",
+            "processing_type": "LLM_PROCESS_AI_ENGINE",
+            "data": result_json
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/upload-prescription-image")
+async def upload_prescription_image(
+         file: UploadFile = File(...)
+):
+    try:
+        image = Image.open(file.file)
+
+        extracted_text = pytesseract.image_to_string(image)
+
+        return {
+            "status": "success",
+            "extracted_text": extracted_text
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/upload-and-summarize")
+async def upload_and_summarize(
+    file: UploadFile = File(...),
+    language: str = "English"
+):
+    try:
+        image = Image.open(file.file)
+        extracted_text = pytesseract.image_to_string(image).strip()
+
+        if len(extracted_text) < 5:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract text from image. Please use a clearer image."
+            )
+
+        request = PrescriptionRequest(
+            prescription_text=extracted_text,
+            language=language
+        )
+        return summarize_prescription(request)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+class AlternativeMedicineRequest(BaseModel):
+    medicine_name: str
+    language: str = "English"
 
 
-    warnings = list(STANDARD_WARNINGS)
-    if any("amoxicillin" in m.name.lower() or "azithromycin" in m.name.lower() for m in medicines):
-        warnings.insert(0, "Antibiotic detected: Do not stop the course early even if you feel better.")
+@app.post("/alternative-medicine")
+def alternative_medicine(request: AlternativeMedicineRequest):
+    try:
+        prompt = f"""
+You are a healthcare assistant for rural users.
 
-    return PrescriptionSummary(
-        patient_summary=patient_summary,
-        medicines=medicines,
-        warnings=warnings[:4]
-    )
+Suggest generic or common alternative medicine information for:
+{request.medicine_name}
+
+Use simple {request.language}.
+Do not give unsafe medical advice.
+Tell the user to confirm with a doctor or pharmacist before replacing medicine.
+
+Return ONLY valid JSON.
+
+JSON format:
+{{
+  "medicine_name": "string",
+  "generic_name": "string",
+  "possible_alternatives": ["string"],
+  "use_case": "string",
+  "dosage_guidance": "single plain text string",
+  "safety_warning": "string",
+  "language": "string"
+}}
+
+IMPORTANT:
+- dosage_guidance MUST be a single string.
+- Do NOT return dosage_guidance as an object or array.
+- Do NOT include markdown.
+- Do NOT include explanation outside JSON.
+
+For dosage_guidance include:
+typical dosage, frequency, and duration in one sentence.
+"""
+
+        response = co.chat(
+            model="command-r-plus-08-2024",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        result_text = response.message.content[0].text
+        result_json = json.loads(result_text)
+
+        return {
+            "status": "success",
+            "processing_type": "LLM_ALTERNATIVE_MEDICINE_ENGINE",
+            "data": result_json
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+class DiseaseInfoRequest(BaseModel):
+    disease_name: str
+    disease_category: str
+    user_type: str = "registered"
+    language: str = "English"
 
 
+@app.post("/disease-info")
+def disease_info(request: DiseaseInfoRequest):
+    try:
 
-@app.get("/sample-response")
-def sample_response():
-    """Returns a hardcoded sample response for UI testing without backend."""
-    return {
-        "patient_summary": (
-            "Take Paracetamol 500mg twice daily after food for 5 days. "
-            "Take Amoxicillin 250mg three times daily with water for 7 days. "
-            "Take Pantoprazole 40mg once daily in the morning before food for 7 days."
-        ),
-        "medicines": [
-            {"name": "Tab. Paracetamol 500mg", "dose": "500mg", "frequency": "Twice daily", "duration": "5 days", "instruction": "After food"},
-            {"name": "Cap. Amoxicillin 250mg", "dose": "250mg", "frequency": "Three times daily", "duration": "7 days", "instruction": "With water"},
-            {"name": "Tab. Pantoprazole 40mg", "dose": "40mg", "frequency": "Once daily in the morning", "duration": "7 days", "instruction": "Before food"},
-        ],
-        "warnings": [
-            "Antibiotic detected: Do not stop the course early even if you feel better.",
-            "Complete the full course even if symptoms improve.",
-            "Consult your doctor immediately if rash, swelling, or difficulty breathing occurs.",
+        allowed_categories = [
+            "Viral Diseases",
+            "Heart Diseases",
+            "Brain Disorders",
+            "Kidney-related Diseases"
         ]
+
+        # STEP 8: category validation
+        if request.disease_category not in allowed_categories:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid disease category"
+            )
+        
+        disease_map = {
+              "Viral Diseases": [
+              "Dengue",
+              "COVID-19",
+              "Influenza",
+              "Chickenpox",
+              "Hepatitis B"
+            ],
+
+               "Heart Diseases": [
+               "Hypertension",
+              "Heart Attack",
+               "Coronary Artery Disease",
+              "Arrhythmia"
+            ],
+
+             "Brain Disorders": [
+              "Migraine",
+            "Epilepsy",
+            "Parkinson's Disease",
+            "Stroke"
+            ],
+
+            "Kidney-related Diseases": [
+             "Kidney Stone",
+             "Chronic Kidney Disease",
+             "Urinary Tract Infection",
+            "Kidney Failure"
+            ]
+        }
+
+        valid_diseases = disease_map.get(request.disease_category, [])
+
+        if request.disease_name not in valid_diseases:
+           raise HTTPException(
+           status_code=400,
+           detail=f"{request.disease_name} does not belong to {request.disease_category}"
+        )
+
+
+        word_limit = 300 if request.user_type == "registered" else 100
+
+        # STEP 9: improved prompt
+        prompt = f"""
+You are a rural healthcare education assistant.
+
+Explain this disease in simple {request.language}.
+
+Disease Category:
+{request.disease_category}
+
+Disease Name:
+{request.disease_name}
+
+User type: {request.user_type}
+Word limit: {word_limit} words.
+
+Include:
+- basic explanation
+- common symptoms
+- prevention
+- diet advice
+- when to consult doctor
+
+IMPORTANT:
+Only provide information related to the selected disease category.
+
+Return ONLY valid JSON with these keys:
+disease_name, explanation, symptoms, prevention, diet_advice, doctor_advice, user_type, language.
+"""
+
+        response = co.chat(
+            model="command-r-plus-08-2024",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+
+        result_json = json.loads(response.message.content[0].text)
+
+        return {
+            "status": "success",
+            "processing_type": "LLM_DISEASE_INFO_ENGINE",
+            "data": result_json
+        }
+
+    except HTTPException:
+     raise
+
+    except Exception as e:
+     raise HTTPException(status_code=500, detail=str(e))
+class AppointmentRequest(BaseModel):
+    patient_name: str
+    symptoms: str
+    disease_category: str
+    appointment_type: str  # quick or scheduled
+    preferred_datetime: Optional[str] = None
+    language: str = "English"
+
+appointments = []
+
+@app.post("/book-appointment")
+def book_appointment(request: AppointmentRequest):
+    appointment_id = str(uuid.uuid4())
+
+    if request.appointment_type.lower() == "quick":
+        scheduled_time = datetime.now() + timedelta(minutes=30)
+        message = "Quick consultation request created. Doctor will respond within 30 minutes."
+
+    elif request.appointment_type.lower() == "scheduled":
+        if not request.preferred_datetime:
+            raise HTTPException(
+                status_code=400,
+                detail="preferred_datetime is required for scheduled appointment"
+            )
+        scheduled_time = request.preferred_datetime
+        message = "Scheduled appointment request created. Waiting for doctor confirmation."
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="appointment_type must be quick or scheduled"
+        )
+
+    appointment = {
+        "appointment_id": appointment_id,
+        "patient_name": request.patient_name,
+        "symptoms": request.symptoms,
+        "disease_category": request.disease_category,
+        "appointment_type": request.appointment_type,
+        "scheduled_time": str(scheduled_time),
+        "status": "Pending",
+        "doctor_response": "Waiting for doctor response",
+        "message": message
     }
+
+    appointments.append(appointment)
+
+    return {
+        "status": "success",
+        "data": appointment
+    }
+
+@app.get("/doctor/appointments")
+def doctor_appointments():
+    return {
+        "status": "success",
+        "appointments": appointments
+    }
+
+@app.post("/doctor/respond-appointment/{appointment_id}")
+def respond_appointment(appointment_id: str, response: str):
+    for appointment in appointments:
+        if appointment["appointment_id"] == appointment_id:
+            if response.lower() == "accept":
+                appointment["status"] = "Accepted"
+                appointment["doctor_response"] = "Doctor accepted the appointment"
+            elif response.lower() == "reject":
+                appointment["status"] = "Rejected"
+                appointment["doctor_response"] = "Doctor rejected the appointment"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="response must be accept or reject"
+                )
+
+            return {
+                "status": "success",
+                "data": appointment
+            }
+
+    raise HTTPException(status_code=404, detail="Appointment not found")
+
+class PersonalizedRecommendationRequest(BaseModel):
+    medical_history: str
+    language: str = "English"
+
+@app.post("/personalized-recommendations")
+def personalized_recommendations(
+    request: PersonalizedRecommendationRequest
+):
+    try:
+
+        prompt = f"""
+You are a healthcare assistant for rural patients.
+
+Based on the patient's medical history below,
+generate personalized health recommendations.
+
+Medical History:
+{request.medical_history}
+
+Provide:
+1. Diet recommendations
+2. Lifestyle recommendations
+3. Preventive care suggestions
+4. Follow-up advice
+
+Use simple {request.language}.
+
+Return ONLY valid JSON:
+
+{{
+  "diet_recommendations": "string",
+  "lifestyle_recommendations": "string",
+  "preventive_care": "string",
+  "follow_up_advice": "string",
+  "language": "string"
+}}
+"""
+
+        response = co.chat(
+            model="command-r-plus-08-2024",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        result_json = json.loads(
+            response.message.content[0].text
+        )
+
+        return {
+            "status": "success",
+            "processing_type": "LLM_PERSONALIZED_RECOMMENDATION_ENGINE",
+            "data": result_json
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )

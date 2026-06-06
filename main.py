@@ -216,76 +216,45 @@ class DiseaseInfoRequest(BaseModel):
 @app.post("/disease-info")
 def disease_info(request: DiseaseInfoRequest):
     try:
-
-        allowed_categories = [
-            "Viral Diseases",
-            "Heart Diseases",
-            "Brain Disorders",
-            "Kidney-related Diseases"
-        ]
-
-        # STEP 8: category validation
-        if request.disease_category not in allowed_categories:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid disease category"
-            )
-        
-        disease_map = {
-              "Viral Diseases": [
-              "Dengue",
-              "COVID-19",
-              "Influenza",
-              "Chickenpox",
-              "Hepatitis B"
-            ],
-
-               "Heart Diseases": [
-               "Hypertension",
-              "Heart Attack",
-               "Coronary Artery Disease",
-              "Arrhythmia"
-            ],
-
-             "Brain Disorders": [
-              "Migraine",
-            "Epilepsy",
-            "Parkinson's Disease",
-            "Stroke"
-            ],
-
-            "Kidney-related Diseases": [
-             "Kidney Stone",
-             "Chronic Kidney Disease",
-             "Urinary Tract Infection",
-            "Kidney Failure"
-            ]
-        }
-
-        valid_diseases = disease_map.get(request.disease_category, [])
-
-        if request.disease_name not in valid_diseases:
-           raise HTTPException(
-           status_code=400,
-           detail=f"{request.disease_name} does not belong to {request.disease_category}"
-        )
-
-
         word_limit = 300 if request.user_type == "registered" else 100
 
-        # STEP 9: improved prompt
         prompt = f"""
 You are a rural healthcare education assistant.
 
-Explain this disease in simple {request.language}.
+The user selected category: {request.disease_category}
+The user is asking about: {request.disease_name}
 
-Disease Category:
-{request.disease_category}
+Valid categories and their diseases:
+- Viral Diseases: Dengue, COVID-19, Influenza, Chickenpox, Hepatitis B, and other viral infections
+- Heart Diseases: Hypertension, Heart Attack, Coronary Artery Disease, Arrhythmia, and other heart conditions
+- Brain Disorders: Migraine, Epilepsy, Parkinson's Disease, Stroke, and other neurological conditions
+- Kidney-related Diseases: Kidney Stone, Chronic Kidney Disease, Urinary Tract Infection, Kidney Failure, and other kidney conditions
 
-Disease Name:
-{request.disease_name}
+Rules:
+1. Be flexible with spelling and case:
+   - "dengue" = "Dengue"
+   - "covid" = "COVID-19"
+   - "heart attack" = "Heart Attack"
+   - "kidney stone" = "Kidney Stone"
+   - "migraine" = "Migraine"
+   - "parkinson" = "Parkinson's Disease"
+2. If the disease belongs to the selected category OR is clearly related to it, proceed with explanation
+3. If the disease clearly does NOT belong to the selected category, return error
 
-User type: {request.user_type}
+Examples of correct matches:
+- "dengue" under "Viral Diseases" → VALID
+- "heart attack" under "Heart Diseases" → VALID
+- "kidney stone" under "Kidney-related Diseases" → VALID
+- "migraine" under "Brain Disorders" → VALID
+- "diabetes" under "Viral Diseases" → INVALID
+
+If INVALID return ONLY this JSON:
+{{
+    "error": "true",
+    "message": "In {request.language}: explain that {request.disease_name} does not belong to {request.disease_category} and suggest the correct category"
+}}
+
+If VALID explain the disease in simple {request.language}.
 Word limit: {word_limit} words.
 
 Include:
@@ -295,11 +264,10 @@ Include:
 - diet advice
 - when to consult doctor
 
-IMPORTANT:
-Only provide information related to the selected disease category.
-
 Return ONLY valid JSON with these keys:
-disease_name, explanation, symptoms, prevention, diet_advice, doctor_advice, user_type, language.
+disease_name, explanation, symptoms, prevention, diet_advice, doctor_advice, user_type, language, error.
+Set error to "false" if valid disease.
+User type: {request.user_type}
 """
 
         response = co.chat(
@@ -310,6 +278,12 @@ disease_name, explanation, symptoms, prevention, diet_advice, doctor_advice, use
 
         result_json = json.loads(response.message.content[0].text)
 
+        if result_json.get("error") == "true":
+            raise HTTPException(
+                status_code=400,
+                detail=result_json.get("message", "Disease does not belong to selected category")
+            )
+
         return {
             "status": "success",
             "processing_type": "LLM_DISEASE_INFO_ENGINE",
@@ -317,10 +291,9 @@ disease_name, explanation, symptoms, prevention, diet_advice, doctor_advice, use
         }
 
     except HTTPException:
-     raise
-
+        raise
     except Exception as e:
-     raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 class AppointmentRequest(BaseModel):
     patient_name: str
     symptoms: str
